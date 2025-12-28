@@ -53,7 +53,7 @@ namespace SemanticKernelPoC.Plugins
                         parameters.Add(new SqliteParameter("@endDate", endDate));
                     }
 
-                    sql += " order by dt ASC LIMIT @limit";
+                    sql += " order by dt asc limit @limit";
 
                     parameters.Add(new SqliteParameter("@limit", limit + 1)); // +1 для has_more
 
@@ -148,4 +148,5 @@ namespace SemanticKernelPoC.Plugins
             }
         }
     }
+
 }
