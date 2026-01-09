@@ -1,0 +1,294 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using SharpToken;
+
+#region Contracts
+
+public interface ITokenEstimator
+{
+    TokenEstimation Estimate(TokenEstimationRequest request);
+}
+
+public sealed record TokenEstimationRequest
+{
+    public required string Model { get; init; }
+
+    public required IReadOnlyList<ChatMessage> Messages { get; init; }
+
+    /// <summary>
+    /// JSON schema describing available tools / functions
+    /// </summary>
+    public string? ToolSchemaJson { get; init; }
+
+    /// <summary>
+    /// Expected assistant output tokens (optional)
+    /// </summary>
+    public int? ExpectedOutputTokens { get; init; }
+}
+
+public sealed record TokenEstimation
+{
+    public int InputTokens { get; init; }
+    public int EstimatedOutputTokens { get; init; }
+    public int TotalTokens => InputTokens + EstimatedOutputTokens;
+
+    public string DetectedLanguage { get; init; } = "unknown";
+}
+
+public sealed record ChatMessage
+(
+    string Role,               // system | developer | user | assistant | tool
+    string Content,
+    ToolCall? ToolCall = null  // present only for assistant messages
+);
+
+public sealed record ToolCall
+(
+    string Name,
+    string ArgumentsJson       // arguments passed to the tool
+);
+
+#endregion
+
+#region Language Detection
+
+public static class LanguageDetector
+{
+    public static string Detect(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return "unknown";
+
+        int ua = 0, ru = 0, en = 0;
+
+        foreach (var c in text)
+        {
+            if ("іїєґІЇЄҐ".Contains(c))
+                ua++;
+            else if ("ыэъёЫЭЪЁ".Contains(c))
+                ru++;
+            else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+                en++;
+        }
+
+        if (ua > ru && ua > en) return "uk";
+        if (ru > ua && ru > en) return "ru";
+        if (en > ua && en > ru) return "en";
+
+        return "mixed";
+    }
+}
+
+#endregion
+
+#region Language Profiles
+
+public static class LanguageTokenProfile
+{
+    /// <summary>
+    /// Multiplier for output estimation (UA is more verbose)
+    /// </summary>
+    public static double OutputMultiplier(string language) => language switch
+    {
+        "uk" => 1.4,
+        "ru" => 1.3,
+        "en" => 1.0,
+        "mixed" => 1.2,
+        _ => 1.25
+    };
+}
+
+#endregion
+
+#region Estimator Implementation
+
+public sealed class OpenAITokenEstimator : ITokenEstimator
+{
+    private readonly Dictionary<string, GptEncoding> _encodings;
+
+    public OpenAITokenEstimator()
+    {
+        _encodings = new()
+        {
+            ["gpt-4o"] = GptEncoding.GetEncoding("cl100k_base"),
+            ["gpt-4o-mini"] = GptEncoding.GetEncoding("cl100k_base"),
+            ["gpt-4.1"] = GptEncoding.GetEncoding("cl100k_base")
+        };
+    }
+
+    public TokenEstimation Estimate(TokenEstimationRequest request)
+    {
+        if (!_encodings.TryGetValue(request.Model, out var encoding))
+            throw new NotSupportedException(
+                $"Model '{request.Model}' is not supported.");
+
+        // 1. Build full prompt including tool schemas, calls and results
+        var fullPrompt = BuildFullPrompt(
+            request.Messages,
+            request.ToolSchemaJson);
+
+        // 2. Detect language based ONLY on user-visible text
+        var userText = string.Join(
+            "\n",
+            request.Messages
+                .Where(m => m.Role == "user")
+                .Select(m => m.Content));
+
+        var language = LanguageDetector.Detect(userText);
+
+        // 3. Accurate input token count
+        var inputTokens = encoding.Encode(fullPrompt).Count;
+
+        // 4. Output estimation (language-aware)
+        var outputTokens = request.ExpectedOutputTokens
+            ?? EstimateOutput(userText, language);
+
+        return new TokenEstimation
+        {
+            InputTokens = inputTokens,
+            EstimatedOutputTokens = outputTokens,
+            DetectedLanguage = language
+        };
+    }
+
+    private static string BuildFullPrompt(
+        IReadOnlyList<ChatMessage> messages,
+        string? toolSchemaJson)
+    {
+        var sb = new StringBuilder();
+
+        // --- Chat messages ---
+        foreach (var msg in messages)
+        {
+            sb.AppendLine($"[{msg.Role.ToUpper()}]");
+            sb.AppendLine(msg.Content);
+
+            // Assistant tool call (arguments ARE TOKENS)
+            if (msg.ToolCall != null)
+            {
+                sb.AppendLine("[TOOL_CALL]");
+                sb.AppendLine($"name: {msg.ToolCall.Name}");
+                sb.AppendLine(msg.ToolCall.ArgumentsJson);
+            }
+        }
+
+        // --- Tool results (role=tool) ---
+        foreach (var toolResult in messages.Where(m => m.Role == "tool"))
+        {
+            sb.AppendLine("[TOOL_RESULT]");
+            sb.AppendLine(toolResult.Content);
+        }
+
+        // --- Tool schemas (VERY expensive) ---
+        if (!string.IsNullOrWhiteSpace(toolSchemaJson))
+        {
+            sb.AppendLine("[TOOLS_SCHEMA]");
+            sb.AppendLine(toolSchemaJson);
+        }
+
+        return sb.ToString();
+    }
+
+    private static int EstimateOutput(
+        string userText,
+        string language)
+    {
+        if (string.IsNullOrWhiteSpace(userText))
+            return 128;
+
+        // Base heuristic: 1 token ≈ 4 chars
+        var baseTokens = userText.Length / 4;
+
+        var multiplier =
+            LanguageTokenProfile.OutputMultiplier(language);
+
+        var estimated = (int)(baseTokens * multiplier);
+
+        // Hard safety bounds
+        return Math.Clamp(estimated, 128, 2048);
+    }
+}
+
+#endregion
+
+
+
+// System / developer
+var messages = new List<ChatMessage>
+{
+    new(
+        Role: "system",
+        Content: "You are a financial assistant. Use tools when required."
+    ),
+
+    // User (Ukrainian)
+    new(
+        Role: "user",
+        Content: "Покажи транзакції клієнта за останні 7 днів"
+    ),
+
+    // Assistant decides to call a tool
+    new(
+        Role: "assistant",
+        Content: "Calling get_transactions",
+        ToolCall: new ToolCall(
+            Name: "get_transactions",
+            ArgumentsJson: """
+            {
+              "customer_id": "12345",
+              "from_date": "2025-01-01",
+              "to_date": "2025-01-07"
+            }
+            """
+        )
+    ),
+
+    // Tool result (VERY IMPORTANT: role = tool)
+    new(
+        Role: "tool",
+        Content: """
+        [
+          { "date": "2025-01-02", "amount": -1200, "currency": "UAH" },
+          { "date": "2025-01-05", "amount": 3500, "currency": "UAH" }
+        ]
+        """
+    )
+};
+
+
+var toolSchemaJson = """
+[
+  {
+    "name": "get_transactions",
+    "description": "Returns customer transactions for a given period",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "customer_id": { "type": "string" },
+        "from_date": { "type": "string", "format": "date" },
+        "to_date": { "type": "string", "format": "date" }
+      },
+      "required": ["customer_id", "from_date", "to_date"]
+    }
+  }
+]
+""";
+
+
+var estimator = new OpenAITokenEstimator();
+
+var estimation = estimator.Estimate(
+    new TokenEstimationRequest
+    {
+        Model = "gpt-4o-mini",
+        Messages = messages,
+        ToolSchemaJson = toolSchemaJson,
+        ExpectedOutputTokens = null // пусть estimator посчитает сам
+    });
+
+Console.WriteLine($"Detected language: {estimation.DetectedLanguage}");
+Console.WriteLine($"Input tokens: {estimation.InputTokens}");
+Console.WriteLine($"Estimated output tokens: {estimation.EstimatedOutputTokens}");
+Console.WriteLine($"Total tokens: {estimation.TotalTokens}");
